@@ -1,0 +1,126 @@
+Title: Postgres schema + stored procedures for versioned workflow with Signwell approvals
+Scope
+Implement Postgres 14 schema contract for ops-first deal capture, immutable core.deal_version snapshots, deterministic approval requirements, and Signwell integration scaffolding. Postgres is the system of record. n8n is glue. Retool is the UI, Signwell is the external approval tool. Xero for financial drafts, posting and ingestion.
+Deliverables
+1) Schemas + tables
+Create: raw, ops, core, audit, config, security.
+ops (editable workspace)
+• ops.deal_draft
+• ops.deal_draft_party
+• ops.deal_draft_broker
+• ops.deal_draft_economics
+• ops.deal_draft_doc_status
+• ops.validation_result
+• ops.exception_queue
+• ops.correction_task
+core (immutable snapshots + gating)
+• core.deal
+• core.deal_version (major/minor ready; v1 can always create new version)
+• core.deal_version_party
+• core.deal_version_broker
+• core.deal_version_economics
+• core.deal_version_doc_checklist_status
+• core.approval_requirement
+• core.approval_response
+• Signwell envelope tracking
+o core.signwell_envelope (envelope_id, status, gate, created_at, closed_at)
+o core.signwell_envelope_recipient (recipient_email, role, signed_at, status)
+o core.signwell_document_artifact (signed PDF link/ref, checksum/hash optional)
+audit (append-only)
+• audit.event_log
+• audit.workflow_run
+• audit.webhook_event (raw webhook payloads, dedupe key)
+• audit.deal_version_diff (optional in v1; required in v2 if implementing major/minor)
+config
+• gates, reason codes, role catalogue, approval rule sets
+• doc checklist templates + conditional rules (JSE/FICA)
+• versioning rule set tables (can be loaded but not fully enforced in v1)
+• Signwell config
+o config.signwell_template (template_id per deal subtype per gate)
+o config.signwell_field_dictionary (strict field keys, types, required flags)
+o config.signwell_recipient_role_map (gate → roles → who)
+security
+• security.identity (email)
+• security.role_assignment
+• security.broker_division_map
+Acceptance tests
+• Schemas exist: raw, ops, core, audit, config, security
+• All required tables exist (list exactly as in spec)
+• PKs exist on every table
+• Critical FKs exist:
+o ops.* children → ops.deal_draft
+o core.deal_version_* → core.deal_version
+o core.approval_* → core.deal_version
+o core.signwell_* → core.deal_version (and envelope where relevant)
+• Append-only enforcement for audit tables (choose one):
+o triggers that block UPDATE/DELETE, or
+o RLS/permissions (preferred) so app roles cannot UPDATE/DELETE audit.*
+Pass criteria
+• A SQL script can assert existence + constraints using information_schema/pg_catalog and returns zero failures.
+2) Stored procedures/functions (contract boundary)
+1. ops.promote_draft_to_core(draft_id, submitted_by_identity_id) returns deal_version_id
+2. core.is_send_eligible(deal_version_id, gate) returns boolean + reason
+(or core.assert_send_eligible(...) raising exception)
+• Checks:
+o deal_version exists, current, correct gate
+o required docs confirmed
+o approval requirements resolved
+o no active open envelope for that deal_version+gate
+o deal_version not rejected/superseded
+3. core.get_signwell_payload(deal_version_id, gate) returns jsonb
+• Returns exact JSON payload required by n8n → Signwell API, built from:
+o config.signwell_template
+o config.signwell_field_dictionary
+o core snapshot tables
+4. core.ingest_signwell_webhook(payload jsonb) returns void
+• Writes:
+o audit.webhook_event (raw + dedupe)
+o updates core.signwell_envelope*
+o inserts audit.event_log
+o inserts/updates core.approval_response equivalents
+o advances/rejects gate per rules:
+ G1/G3: any FIN_APPROVER signature completes (if using Signwell there)
+ G2: all recipients must sign; any decline rejects
+Acceptance tests
+Goal: prove ops-first promotion works and enforces invariants.
+Setup
+• Insert minimal config: gate catalogue, doc checklist templates, approval rules, role catalogue
+• Insert identities for ops + finance approver
+• Create a valid ops draft with:
+o deal subtype
+o parties + JSE flag
+o brokers (including lead broker)
+o economics
+o required docs confirmed
+Tests
+1. Promotion success path
+• Calling ops.promote_draft_to_core() returns a deal_version_id
+• Creates core.deal if missing
+• Creates core.deal_version + snapshot rows
+• Sets draft to SUBMITTED (or freezes it per your rule)
+• Writes audit.event_log entries: PROMOTED + G1_ENTERED (or equivalent)
+• Creates core.approval_requirement rows for G1 per rule set
+2. Promotion blocks when docs missing
+• Mark a required doc unconfirmed → promotion must fail
+• Failure must create ops.validation_result (or raise and not promote, but you need one of these behaviours consistently)
+3. Promotion blocks when lead broker missing
+• Remove lead broker flag → promotion fails
+Pass criteria
+• Deterministic assertions on row counts + foreign keys + expected gate state.
+3) Seed configuration
+• Gate catalogue G0–G5
+• Approval rules:
+o G1: any FIN_APPROVER
+o G2: all brokers + divisional head of lead broker
+o G3: any FIN_APPROVER
+• Doc checklist templates as provided + JSE/FICA rule
+• Signwell templates: placeholder rows for the four subtype buckets per gate used (at minimum G2)
+Acceptance tests
+• Promote ops draft → creates core.deal_version + audit events
+• core.get_signwell_payload(deal_version_id,'G2') returns valid JSON with strict keys
+• core.is_send_eligible blocks invalid sends and returns reason
+• core.ingest_signwell_webhook updates DB state deterministically and app reads from DB only
+Milestones:
+1) Schema skeleton + migrations + core ops-first tables + Signwell tracking tables
+2) Promote function + doc template rules + approval requirement materialization (G1/G2/G3 rules)
+3) Signwell payload view/function + send-eligibility guard + webhook ingest function
