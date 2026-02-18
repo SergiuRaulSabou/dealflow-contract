@@ -1,4 +1,4 @@
-# Xero Integration Workflow (DB-as-Contract)
+# dealflow-contract (DB-as-Contract Workflow)
 
 ## What This System Is
 This project defines a **database-first deal workflow** that runs through Gates `G0` to `G3`:
@@ -119,6 +119,26 @@ flyway -configFiles=flyway.seed.conf migrate
 ```bash
 make verify
 ```
+
+## Acceptance Pack (Milestone 0.5 + 1)
+You can run acceptance for Milestone `0.5` and `1` either via Flyway-targeted migration or via Make.
+
+### Option A: Flyway (targeted to V002)
+```bash
+make up
+flyway -configFiles=flyway.conf -target=2 migrate
+flyway -configFiles=flyway.seed.conf migrate
+make verify_0_5_1
+```
+
+### Option B: Make (single command)
+```bash
+make reset_0_5_1
+```
+
+Notes:
+- `make bootstrap` / `make reset` runs all currently implemented milestones (including Milestone 2).
+- Use `make acceptance_0_5_1` / `make reset_0_5_1` when you want Milestone 0.5 + 1 only.
 
 ## Migration Naming Rationale
 Flyway `V###` numbers represent **execution order**, not milestone labels.
