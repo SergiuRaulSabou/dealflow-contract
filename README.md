@@ -120,25 +120,48 @@ flyway -configFiles=flyway.seed.conf migrate
 make verify
 ```
 
-## Acceptance Pack (Milestone 0.5 + 1)
-You can run acceptance for Milestone `0.5` and `1` either via Flyway-targeted migration or via Make.
+## Boundary Acceptance Runbook
+Acceptance is packaged around deterministic boundary commands from a clean DB.
 
-### Option A: Flyway (targeted to V002)
+### Milestone 1 (Schema Skeleton)
+```bash
+make reset_1
+```
+
+Equivalent manual boundary flow:
 ```bash
 make up
+make migrate_1
+make verify_1
+```
+
+### Milestone 0.5 + 1 (Proof Slice at target=2)
+Milestone `0.5` depends on seeded config catalog/rule data. The deterministic boundary flow is:
+
+```bash
+make reset_0_5_1
+```
+
+Equivalent manual boundary flow:
+```bash
+make up
+make migrate_0_5_1
+make seed
+make verify_0_5_1
+```
+
+Equivalent Flyway-targeted boundary flow:
+```bash
+make up
+make create-db
 flyway -configFiles=flyway.conf -target=2 migrate
 flyway -configFiles=flyway.seed.conf migrate
 make verify_0_5_1
 ```
 
-### Option B: Make (single command)
-```bash
-make reset_0_5_1
-```
-
 Notes:
 - `make bootstrap` / `make reset` runs all currently implemented milestones (including Milestone 2).
-- Use `make acceptance_0_5_1` / `make reset_0_5_1` when you want Milestone 0.5 + 1 only.
+- Boundary acceptance commands (`reset_1`, `reset_0_5_1`) intentionally avoid requiring later migrations.
 
 ## Migration Naming Rationale
 Flyway `V###` numbers represent **execution order**, not milestone labels.

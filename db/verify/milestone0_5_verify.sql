@@ -23,6 +23,31 @@ BEGIN
 END;
 $$;
 
+-- Preflight: proof-slice checks require baseline seed catalogs/rules.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM config.gate_catalog gc
+        WHERE gc.gate_key = 'G0'
+    ) THEN
+        RAISE EXCEPTION 'Missing required seed data (config.gate_catalog:G0). Run seed migrations before milestone0_5_verify.sql';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM config.doc_checklist_template dct
+        JOIN config.doc_checklist_template_item dcti
+          ON dcti.doc_checklist_template_id = dct.doc_checklist_template_id
+        WHERE dct.deal_subtype_key = 'LEASE_ACQUISITION_OR_RENEWAL'
+          AND dcti.gate_key = 'G1'
+          AND dcti.checklist_item_key IN ('DEALSHEET_SIGNED', 'OTP_OR_LEASE')
+    ) THEN
+        RAISE EXCEPTION 'Missing required seed data (G1 checklist items for LEASE_ACQUISITION_OR_RENEWAL). Run seed migrations before milestone0_5_verify.sql';
+    END IF;
+END;
+$$;
+
 -- Negative test: FK enforcement (ops child -> ops.deal_draft).
 DO $$
 BEGIN
