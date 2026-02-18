@@ -92,7 +92,6 @@ BEGIN
         deal_business_key,
         deal_subtype_key,
         current_gate_key,
-        is_jse_listed,
         created_by_identity_id,
         updated_by_identity_id
     )
@@ -100,7 +99,6 @@ BEGIN
         'VERIFY-' || v_identity_id::text,
         'LEASE_ACQUISITION_OR_RENEWAL',
         'G0',
-        FALSE,
         v_identity_id,
         v_identity_id
     )
@@ -154,7 +152,6 @@ BEGIN
         deal_business_key,
         deal_subtype_key,
         current_gate_key,
-        is_jse_listed,
         created_by_identity_id,
         updated_by_identity_id
     )
@@ -162,7 +159,6 @@ BEGIN
         'VERIFY-NO-LEAD-' || v_identity_id::text,
         'LEASE_ACQUISITION_OR_RENEWAL',
         'G0',
-        FALSE,
         v_identity_id,
         v_identity_id
     )
@@ -193,7 +189,6 @@ BEGIN
         deal_business_key,
         deal_subtype_key,
         current_gate_key,
-        is_jse_listed,
         created_by_identity_id,
         updated_by_identity_id
     )
@@ -201,7 +196,6 @@ BEGIN
         'VERIFY-DOCS-UNCONFIRMED-' || v_identity_id::text,
         'LEASE_ACQUISITION_OR_RENEWAL',
         'G0',
-        FALSE,
         v_identity_id,
         v_identity_id
     )

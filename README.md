@@ -1,4 +1,4 @@
-# dealflow-contract (DB-as-Contract Workflow)
+# dealflow-contract
 
 ## What This System Is
 This project defines a **database-first deal workflow** that runs through Gates `G0` to `G3`:
