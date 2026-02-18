@@ -29,6 +29,8 @@ The PostgreSQL database is the **system of record and contract boundary** for:
 - `db/migrations/`: SQL migrations
 - `db/seeds/`: baseline seed data (catalogues/rules/templates)
 - `db/verify/`: SQL verification harness scripts
+- `flyway.conf`: Flyway config for structural migrations (`V*`)
+- `flyway.seed.conf`: Flyway config for seed migrations (`S*`)
 - `compose.yml`: local Postgres container runtime
 - `Makefile`: local run/test commands for migration verification
 - `.env.example`: local environment defaults
@@ -94,3 +96,35 @@ Verification scripts:
 - `db/verify/seed_verify.sql` (seed data contract)
 - `db/verify/milestone0_5_verify.sql` (proof-slice checks + negative tests)
 - `db/verify/milestone2_verify.sql` (promotion + checklist rules + approval materialization)
+
+## Flyway Runbook
+Assumes local DB from `make up` (or any reachable Postgres instance).
+
+1. Run structural migrations (`V*`):
+
+```bash
+flyway -configFiles=flyway.conf info
+flyway -configFiles=flyway.conf migrate
+```
+
+2. Run seed migrations (`S*`):
+
+```bash
+flyway -configFiles=flyway.seed.conf info
+flyway -configFiles=flyway.seed.conf migrate
+```
+
+3. Run verification suite:
+
+```bash
+make verify
+```
+
+## Migration Naming Rationale
+Flyway `V###` numbers represent **execution order**, not milestone labels.
+
+- `V001__milestone1_schema_skeleton.sql` is first because it creates the base schemas/tables everything else depends on.
+- `V002__milestone0_5_proof_slice.sql` is second because Proof Slice logic (promotion function/negative checks) requires tables created in `V001`.
+- `V003__milestone2_workflow_engine.sql` builds on both previous migrations.
+
+So the numbering is dependency/order-driven (Flyway-safe), while milestone names remain business labels.
