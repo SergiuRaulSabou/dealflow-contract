@@ -159,9 +159,33 @@ flyway -configFiles=flyway.seed.conf migrate
 make verify_0_5_1
 ```
 
+### Milestone 2 (Workflow Engine at target=3)
+Milestone `2` extends promotion invariants with template-driven doc requirements and deterministic approval materialization.
+
+```bash
+make reset_2
+```
+
+Equivalent manual boundary flow:
+```bash
+make up
+make migrate_2
+make seed
+make verify_2
+```
+
+Equivalent Flyway-targeted boundary flow:
+```bash
+make up
+make create-db
+flyway -configFiles=flyway.conf -target=3 migrate
+flyway -configFiles=flyway.seed.conf migrate
+make verify_2
+```
+
 Notes:
 - `make bootstrap` / `make reset` runs all currently implemented milestones (including Milestone 2).
-- Boundary acceptance commands (`reset_1`, `reset_0_5_1`) intentionally avoid requiring later migrations.
+- Boundary acceptance commands (`reset_1`, `reset_0_5_1`, `reset_2`) intentionally avoid requiring later migrations.
 
 ## Migration Naming Rationale
 Flyway `V###` numbers represent **execution order**, not milestone labels.

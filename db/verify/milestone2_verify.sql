@@ -13,9 +13,15 @@ DECLARE
     v_draft_id BIGINT;
     v_draft_id_non_jse BIGINT;
     v_draft_id_missing_doc BIGINT;
+    v_draft_id_missing_fica BIGINT;
     v_draft_id_no_lead BIGINT;
+    v_draft_id_no_econ BIGINT;
     v_deal_version_id BIGINT;
     v_deal_version_id_non_jse BIGINT;
+    v_expected_g1 INTEGER;
+    v_expected_g2 INTEGER;
+    v_expected_g3 INTEGER;
+    v_actual_g1 INTEGER;
     v_inserted_g2 INTEGER;
     v_inserted_g3 INTEGER;
     v_reinserted_g2 INTEGER;
@@ -33,6 +39,34 @@ BEGIN
         'Finance Approver'
     )
     RETURNING identity_id INTO v_fin_identity_id;
+
+    SELECT COUNT(*)
+    INTO v_expected_g1
+    FROM config.approval_rule ar
+    JOIN config.approval_rule_set ars
+      ON ars.approval_rule_set_id = ar.approval_rule_set_id
+    WHERE ars.rule_set_key = 'DEFAULT_GATES_0_3'
+      AND ar.gate_key = 'G1';
+
+    SELECT COUNT(*)
+    INTO v_expected_g2
+    FROM config.approval_rule ar
+    JOIN config.approval_rule_set ars
+      ON ars.approval_rule_set_id = ar.approval_rule_set_id
+    WHERE ars.rule_set_key = 'DEFAULT_GATES_0_3'
+      AND ar.gate_key = 'G2';
+
+    SELECT COUNT(*)
+    INTO v_expected_g3
+    FROM config.approval_rule ar
+    JOIN config.approval_rule_set ars
+      ON ars.approval_rule_set_id = ar.approval_rule_set_id
+    WHERE ars.rule_set_key = 'DEFAULT_GATES_0_3'
+      AND ar.gate_key = 'G3';
+
+    IF v_expected_g1 = 0 OR v_expected_g2 = 0 OR v_expected_g3 = 0 THEN
+        RAISE EXCEPTION 'Expected approval rules for G1/G2/G3 in DEFAULT_GATES_0_3';
+    END IF;
 
     -- Happy-path: JSE listed => FICA required.
     INSERT INTO ops.deal_draft (
@@ -93,13 +127,14 @@ BEGIN
         RAISE EXCEPTION 'Expected PROMOTED and G1_ENTERED events for promoted deal_version';
     END IF;
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM core.approval_requirement ar
-        WHERE ar.deal_version_id = v_deal_version_id
-          AND ar.gate_key = 'G1'
-    ) THEN
-        RAISE EXCEPTION 'Expected G1 approval requirements to be materialized at promotion';
+    SELECT COUNT(*)
+    INTO v_actual_g1
+    FROM core.approval_requirement ar
+    WHERE ar.deal_version_id = v_deal_version_id
+      AND ar.gate_key = 'G1';
+
+    IF v_actual_g1 <> v_expected_g1 THEN
+        RAISE EXCEPTION 'Expected % G1 approval requirements to be materialized at promotion, got %', v_expected_g1, v_actual_g1;
     END IF;
 
     IF NOT EXISTS (
@@ -203,6 +238,52 @@ BEGIN
         RAISE EXCEPTION 'Expected DOC_REQUIRED validation for missing OTP_OR_LEASE doc';
     END IF;
 
+    -- Negative-path: JSE-listed without FICA_COMPLETE should fail (conditional requirement).
+    INSERT INTO ops.deal_draft (
+        deal_business_key,
+        deal_subtype_key,
+        current_gate_key,
+        is_jse_listed,
+        created_by_identity_id,
+        updated_by_identity_id
+    )
+    VALUES (
+        'M2-VERIFY-MISSING-FICA-' || v_ops_identity_id::text,
+        'LEASE_ACQUISITION_OR_RENEWAL',
+        'G0',
+        TRUE,
+        v_ops_identity_id,
+        v_ops_identity_id
+    )
+    RETURNING draft_id INTO v_draft_id_missing_fica;
+
+    INSERT INTO ops.deal_draft_broker (draft_id, broker_identity_id, is_lead_broker, split_percent)
+    VALUES (v_draft_id_missing_fica, v_ops_identity_id, TRUE, 100.0);
+
+    INSERT INTO ops.deal_draft_doc_status (draft_id, doc_code, is_confirmed, confirmed_by_identity_id, confirmed_at)
+    VALUES
+        (v_draft_id_missing_fica, 'DEALSHEET_SIGNED', TRUE, v_ops_identity_id, NOW()),
+        (v_draft_id_missing_fica, 'OTP_OR_LEASE', TRUE, v_ops_identity_id, NOW());
+
+    INSERT INTO ops.deal_draft_economics (draft_id, gross_billings, commission_total, company_split_pct, broker_split_pct)
+    VALUES (v_draft_id_missing_fica, 1000.00, 100.00, 50.0, 50.0);
+
+    v_deal_version_id := ops.promote_draft_to_core(v_draft_id_missing_fica, v_ops_identity_id);
+    IF v_deal_version_id IS NOT NULL THEN
+        RAISE EXCEPTION 'Expected promotion to fail when FICA is conditionally required but missing';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM ops.validation_result vr
+        WHERE vr.draft_id = v_draft_id_missing_fica
+          AND vr.rule_code = 'DOC_REQUIRED'
+          AND vr.severity = 'ERROR'
+          AND vr.field_path = 'ops.deal_draft_doc_status.FICA_COMPLETE'
+    ) THEN
+        RAISE EXCEPTION 'Expected DOC_REQUIRED validation for missing FICA_COMPLETE under JSE/FICA condition';
+    END IF;
+
     -- Negative-path: missing lead broker must fail.
     INSERT INTO ops.deal_draft (
         deal_business_key,
@@ -245,17 +326,59 @@ BEGIN
         RAISE EXCEPTION 'Expected LEAD_BROKER_REQUIRED validation for missing lead broker';
     END IF;
 
+    -- Negative-path: missing economics must fail.
+    INSERT INTO ops.deal_draft (
+        deal_business_key,
+        deal_subtype_key,
+        current_gate_key,
+        is_jse_listed,
+        created_by_identity_id,
+        updated_by_identity_id
+    )
+    VALUES (
+        'M2-VERIFY-NO-ECON-' || v_ops_identity_id::text,
+        'LEASE_ACQUISITION_OR_RENEWAL',
+        'G0',
+        FALSE,
+        v_ops_identity_id,
+        v_ops_identity_id
+    )
+    RETURNING draft_id INTO v_draft_id_no_econ;
+
+    INSERT INTO ops.deal_draft_broker (draft_id, broker_identity_id, is_lead_broker, split_percent)
+    VALUES (v_draft_id_no_econ, v_ops_identity_id, TRUE, 100.0);
+
+    INSERT INTO ops.deal_draft_doc_status (draft_id, doc_code, is_confirmed, confirmed_by_identity_id, confirmed_at)
+    VALUES
+        (v_draft_id_no_econ, 'DEALSHEET_SIGNED', TRUE, v_ops_identity_id, NOW()),
+        (v_draft_id_no_econ, 'OTP_OR_LEASE', TRUE, v_ops_identity_id, NOW());
+
+    v_deal_version_id := ops.promote_draft_to_core(v_draft_id_no_econ, v_ops_identity_id);
+    IF v_deal_version_id IS NOT NULL THEN
+        RAISE EXCEPTION 'Expected promotion to fail without economics, but it succeeded';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM ops.validation_result vr
+        WHERE vr.draft_id = v_draft_id_no_econ
+          AND vr.rule_code = 'ECONOMICS_REQUIRED'
+          AND vr.severity = 'ERROR'
+    ) THEN
+        RAISE EXCEPTION 'Expected ECONOMICS_REQUIRED validation for missing economics';
+    END IF;
+
     -- Prove approval requirement materialization works for G2 and G3 (rule-set driven + idempotent).
     SELECT core.materialize_approval_requirements(v_deal_version_id_non_jse, 'G2', 'DEFAULT_GATES_0_3')
     INTO v_inserted_g2;
-    IF v_inserted_g2 < 2 THEN
-        RAISE EXCEPTION 'Expected at least 2 approval requirements inserted for G2, got %', v_inserted_g2;
+    IF v_inserted_g2 <> v_expected_g2 THEN
+        RAISE EXCEPTION 'Expected % approval requirements inserted for G2, got %', v_expected_g2, v_inserted_g2;
     END IF;
 
     SELECT core.materialize_approval_requirements(v_deal_version_id_non_jse, 'G3', 'DEFAULT_GATES_0_3')
     INTO v_inserted_g3;
-    IF v_inserted_g3 < 1 THEN
-        RAISE EXCEPTION 'Expected at least 1 approval requirement inserted for G3, got %', v_inserted_g3;
+    IF v_inserted_g3 <> v_expected_g3 THEN
+        RAISE EXCEPTION 'Expected % approval requirements inserted for G3, got %', v_expected_g3, v_inserted_g3;
     END IF;
 
     SELECT core.materialize_approval_requirements(v_deal_version_id_non_jse, 'G2', 'DEFAULT_GATES_0_3')
@@ -267,4 +390,3 @@ END;
 $$;
 
 ROLLBACK;
-
