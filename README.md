@@ -50,15 +50,17 @@ Based on the requirements documents in `docs/`:
 There is **no mandatory general-purpose application language** (for example Node.js, Python, Java, or Go) specified as a core requirement for this phase.
 
 ## Current Status
-- Milestone 0.5 (Proof Slice), Milestone 1 (Schema Skeleton), and Milestone 2 (Deterministic Workflow Engine) are implemented:
+- Milestone 0.5 (Proof Slice), Milestone 1 (Schema Skeleton), Milestone 2 (Deterministic Workflow Engine), and Milestone 3 (Signwell Contract Surface) are implemented:
   - `db/migrations/V001__milestone1_schema_skeleton.sql`
   - `db/migrations/V002__milestone0_5_proof_slice.sql`
   - `db/migrations/V003__milestone2_workflow_engine.sql`
+  - `db/migrations/V004__milestone3_signwell_contract.sql`
   - `db/seeds/S001__baseline_config_seed.sql`
   - `db/verify/milestone1_verify.sql`
   - `db/verify/seed_verify.sql`
   - `db/verify/milestone0_5_verify.sql`
   - `db/verify/milestone2_verify.sql`
+  - `db/verify/milestone3_verify.sql`
 
 ## Local Execution (Podman + Make)
 This project is now runnable locally with Podman Compose and Make.
@@ -96,6 +98,7 @@ Verification scripts:
 - `db/verify/seed_verify.sql` (seed data contract)
 - `db/verify/milestone0_5_verify.sql` (proof-slice checks + negative tests)
 - `db/verify/milestone2_verify.sql` (promotion + checklist rules + approval materialization)
+- `db/verify/milestone3_verify.sql` (send eligibility + payload contract + webhook ingest)
 
 ## Flyway Runbook
 Assumes local DB from `make up` (or any reachable Postgres instance).
@@ -183,9 +186,36 @@ flyway -configFiles=flyway.seed.conf migrate
 make verify_2
 ```
 
+### Milestone 3 (Signwell Contract Surface at target=4)
+Milestone `3` delivers:
+- `core.is_send_eligible(...)` and `core.assert_send_eligible(...)`
+- `core.get_signwell_payload(...)`
+- `core.ingest_signwell_webhook(...)`
+
+```bash
+make reset_3
+```
+
+Equivalent manual boundary flow:
+```bash
+make up
+make migrate_3
+make seed
+make verify_3
+```
+
+Equivalent Flyway-targeted boundary flow:
+```bash
+make up
+make create-db
+flyway -configFiles=flyway.conf -target=4 migrate
+flyway -configFiles=flyway.seed.conf migrate
+make verify_3
+```
+
 Notes:
-- `make bootstrap` / `make reset` runs all currently implemented milestones (including Milestone 2).
-- Boundary acceptance commands (`reset_1`, `reset_0_5_1`, `reset_2`) intentionally avoid requiring later migrations.
+- `make bootstrap` / `make reset` runs all currently implemented milestones (including Milestone 3).
+- Boundary acceptance commands (`reset_1`, `reset_0_5_1`, `reset_2`, `reset_3`) intentionally avoid requiring later migrations.
 
 ## Migration Naming Rationale
 Flyway `V###` numbers represent **execution order**, not milestone labels.
@@ -193,5 +223,6 @@ Flyway `V###` numbers represent **execution order**, not milestone labels.
 - `V001__milestone1_schema_skeleton.sql` is first because it creates the base schemas/tables everything else depends on.
 - `V002__milestone0_5_proof_slice.sql` is second because Proof Slice logic (promotion function/negative checks) requires tables created in `V001`.
 - `V003__milestone2_workflow_engine.sql` builds on both previous migrations.
+- `V004__milestone3_signwell_contract.sql` adds Signwell send eligibility, payload generation, and webhook ingest contract functions.
 
 So the numbering is dependency/order-driven (Flyway-safe), while milestone names remain business labels.
