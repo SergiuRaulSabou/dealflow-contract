@@ -31,7 +31,7 @@ BEGIN
         FROM config.gate_catalog gc
         WHERE gc.gate_key = 'G0'
     ) THEN
-        RAISE EXCEPTION 'Missing required seed data (config.gate_catalog:G0). Run seed migrations before milestone0_5_verify.sql';
+        RAISE EXCEPTION 'Missing required seed data (config.gate_catalog:G0). Run seed migrations before proof_slice_verify.sql';
     END IF;
 
     IF NOT EXISTS (
@@ -43,7 +43,7 @@ BEGIN
           AND dcti.gate_key = 'G1'
           AND dcti.checklist_item_key IN ('DEALSHEET_SIGNED', 'OTP_OR_LEASE')
     ) THEN
-        RAISE EXCEPTION 'Missing required seed data (G1 checklist items for LEASE_ACQUISITION_OR_RENEWAL). Run seed migrations before milestone0_5_verify.sql';
+        RAISE EXCEPTION 'Missing required seed data (G1 checklist items for LEASE_ACQUISITION_OR_RENEWAL). Run seed migrations before proof_slice_verify.sql';
     END IF;
 END;
 $$;
