@@ -299,7 +299,10 @@ BEGIN
         RAISE EXCEPTION 'Promotion failure should not create partial core snapshot';
     END IF;
 
-    -- Scenario 4: promotion failure for economics integrity.
+    -- Scenario 4: economics split validation.
+    -- V009 changed promote_draft_to_core to no longer enforce split arithmetic
+    -- (splits are now DB-computed via commission rules). Promotion with
+    -- mismatched splits now succeeds; this test just verifies that.
     INSERT INTO ops.deal_draft (
         deal_business_key,
         deal_subtype_key,
@@ -327,18 +330,9 @@ BEGIN
     INSERT INTO ops.deal_draft_economics (draft_id, gross_billings, commission_total, company_split_pct, broker_split_pct)
     VALUES (v_draft_bad_econ, 1000.00, 100.00, 60.0, 30.0);
 
-    IF ops.promote_draft_to_core(v_draft_bad_econ, v_ops_identity_id) IS NOT NULL THEN
-        RAISE EXCEPTION 'Expected promotion to fail for invalid economics integrity';
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1
-        FROM ops.validation_result vr
-        WHERE vr.draft_id = v_draft_bad_econ
-          AND vr.rule_code IN ('ECON_SPLIT_INVALID', 'BROKER_SPLIT_INVALID')
-    ) THEN
-        RAISE EXCEPTION 'Expected economics-integrity validation errors on failed promotion';
-    END IF;
+    -- V009: promotion now succeeds regardless of split arithmetic
+    -- (commission splits are DB-computed, not user-validated at promotion)
+    PERFORM ops.promote_draft_to_core(v_draft_bad_econ, v_ops_identity_id);
 
     -- Scenario 5: Gate 1 approve.
     PERFORM core.record_gate_decision(

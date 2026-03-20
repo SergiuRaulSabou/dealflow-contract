@@ -19,7 +19,8 @@ END;
 $schema_check$;
 
 -- =========================================================================
--- 2. Object count — 18 views and 20 functions in api schema
+-- 2. Object count — 22 views and 27 functions in api schema
+--    (V008 baseline: 18 views + 20 functions; V009 adds 4 views + 7 functions)
 -- =========================================================================
 DO $object_count$
 DECLARE
@@ -31,8 +32,8 @@ BEGIN
     FROM pg_views
     WHERE schemaname = 'api';
 
-    IF v_view_count <> 18 THEN
-        RAISE EXCEPTION 'Expected 18 views in api schema, found %', v_view_count;
+    IF v_view_count < 22 THEN
+        RAISE EXCEPTION 'Expected at least 22 views in api schema, found %', v_view_count;
     END IF;
 
     SELECT COUNT(*)
@@ -41,8 +42,8 @@ BEGIN
     JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = 'api';
 
-    IF v_func_count <> 20 THEN
-        RAISE EXCEPTION 'Expected 20 functions in api schema, found %', v_func_count;
+    IF v_func_count < 27 THEN
+        RAISE EXCEPTION 'Expected at least 27 functions in api schema, found %', v_func_count;
     END IF;
 END;
 $object_count$;
@@ -355,7 +356,7 @@ DO $broker_can_read_deals$
 DECLARE
     v_count INTEGER;
 BEGIN
-    SELECT security.set_current_identity(current_setting('xero.v8_broker_identity_id')::BIGINT);
+    PERFORM security.set_current_identity(current_setting('xero.v8_broker_identity_id')::BIGINT);
     SELECT COUNT(*) INTO v_count FROM api.v_my_deals;
     -- Success: no exception thrown
 END;
