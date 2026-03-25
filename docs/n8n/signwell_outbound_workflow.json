@@ -1,0 +1,111 @@
+{
+  "name": "Signwell Outbound (DB-as-Contract)",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [200, 300]
+    },
+    {
+      "id": "db-eligibility",
+      "name": "DB Eligibility",
+      "type": "n8n-nodes-base.postgres",
+      "position": [430, 300],
+      "parameters": {
+        "query": "SELECT * FROM core.is_send_eligible($1::bigint, $2::text);",
+        "queryParameters": ["={{$json.deal_version_id}}", "={{$json.gate_key}}"]
+      }
+    },
+    {
+      "id": "if-eligible",
+      "name": "Eligible?",
+      "type": "n8n-nodes-base.if",
+      "position": [650, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.is_eligible}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "db-payload",
+      "name": "DB Payload",
+      "type": "n8n-nodes-base.postgres",
+      "position": [880, 220],
+      "parameters": {
+        "query": "SELECT core.get_signwell_payload($1::bigint, $2::text) AS payload;",
+        "queryParameters": ["={{$json.deal_version_id}}", "={{$json.gate_key}}"]
+      }
+    },
+    {
+      "id": "http-signwell",
+      "name": "Send To Signwell",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1120, 220],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SIGNWELL_API_URL}}",
+        "sendHeaders": true,
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SIGNWELL_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "jsonBody": "={{$json.payload}}"
+      }
+    },
+    {
+      "id": "db-record-envelope",
+      "name": "Record Envelope",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1360, 220],
+      "parameters": {
+        "query": "SELECT core.record_signwell_envelope($1::bigint,$2::text,$3::text,$4::text,$5::bigint);",
+        "queryParameters": [
+          "={{$json.deal_version_id}}",
+          "={{$json.gate_key}}",
+          "={{$json.envelope_id}}",
+          "={{$json.dedupe_key}}",
+          "={{$json.actor_identity_id}}"
+        ]
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{"node": "DB Eligibility", "type": "main", "index": 0}]]
+    },
+    "DB Eligibility": {
+      "main": [[{"node": "Eligible?", "type": "main", "index": 0}]]
+    },
+    "Eligible?": {
+      "main": [
+        [{"node": "DB Payload", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "DB Payload": {
+      "main": [[{"node": "Send To Signwell", "type": "main", "index": 0}]]
+    },
+    "Send To Signwell": {
+      "main": [[{"node": "Record Envelope", "type": "main", "index": 0}]]
+    }
+  },
+  "meta": {
+    "notes": "Glue-only workflow. Business rules remain in DB contract surfaces."
+  }
+}

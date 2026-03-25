@@ -1,0 +1,47 @@
+{
+  "name": "Signwell Inbound Webhook (DB-as-Contract)",
+  "nodes": [
+    {
+      "id": "webhook",
+      "name": "Signwell Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300],
+      "parameters": {
+        "path": "signwell/webhook",
+        "httpMethod": "POST",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "db-ingest",
+      "name": "DB Ingest",
+      "type": "n8n-nodes-base.postgres",
+      "position": [520, 300],
+      "parameters": {
+        "query": "SELECT core.ingest_signwell_webhook($1::jsonb);",
+        "queryParameters": ["={{JSON.stringify($json)}}"]
+      }
+    },
+    {
+      "id": "respond",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [800, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\":\"accepted\",\"idempotent\":true}"
+      }
+    }
+  ],
+  "connections": {
+    "Signwell Webhook": {
+      "main": [[{"node": "DB Ingest", "type": "main", "index": 0}]]
+    },
+    "DB Ingest": {
+      "main": [[{"node": "Webhook Response", "type": "main", "index": 0}]]
+    }
+  },
+  "meta": {
+    "notes": "Inbound retries are safe due to DB-side dedupe by event_id."
+  }
+}
