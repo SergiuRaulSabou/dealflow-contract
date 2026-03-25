@@ -1,0 +1,491 @@
+BEGIN;
+
+-- =========================================================================
+-- V011 — Promotion Function Update (extends V009 Section 20)
+--
+-- V009 already rewrites ops.promote_draft_to_core as a full function
+-- (not a wrapper). It snapshots: parties (with V009 extensions), brokers
+-- (with role_instance_id, broker_slot, division_key), economics (with
+-- invoice/settlement fields), property, external referral, docs.
+--
+-- This migration extends V009's promotion function to also snapshot:
+--   - V010 party column: legal_name
+--   - V010 broker columns: role_on_deal, participant_type, commission_pct,
+--     commission_override_pct, override_reason
+--   - V010 doc columns: is_overridden, override_reason, file_reference
+--   - V010 header columns: estimated_deadline, division_key
+--   - V010 milestones table
+--   - Hash function update to include milestones
+--
+-- Strategy: replace V009's promote_draft_to_core with an updated version
+-- that includes all V010 columns in the INSERT statements and adds
+-- milestone snapshot. This is a direct replacement, not a wrapper.
+-- =========================================================================
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_ops') THEN CREATE ROLE app_ops NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_finance') THEN CREATE ROLE app_finance NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_broker') THEN CREATE ROLE app_broker NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_ui') THEN CREATE ROLE app_ui NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_system') THEN CREATE ROLE app_system NOLOGIN; END IF;
+END;
+$$;
+
+-- =========================================================================
+-- SECTION 1 — Updated promotion function
+-- =========================================================================
+CREATE OR REPLACE FUNCTION ops.promote_draft_to_core(
+    p_draft_id BIGINT,
+    p_submitted_by_identity_id BIGINT
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_draft ops.deal_draft%ROWTYPE;
+    v_has_identity BOOLEAN;
+    v_has_lead_broker BOOLEAN;
+    v_business_key TEXT;
+    v_deal_id BIGINT;
+    v_prev_deal_version_id BIGINT;
+    v_prev_major INTEGER;
+    v_prev_minor INTEGER;
+    v_new_major INTEGER;
+    v_new_minor INTEGER;
+    v_new_deal_version_id BIGINT;
+    v_template_id BIGINT;
+    v_requires_fica BOOLEAN;
+    v_missing_required_docs INTEGER;
+    v_unconfirmed_required_docs INTEGER;
+BEGIN
+    -- ---- Identity check ----
+    SELECT EXISTS (
+        SELECT 1 FROM security.identity i WHERE i.identity_id = p_submitted_by_identity_id
+    ) INTO v_has_identity;
+
+    IF NOT v_has_identity THEN
+        RAISE EXCEPTION 'submitted_by_identity_id % does not exist', p_submitted_by_identity_id;
+    END IF;
+
+    -- ---- Lock draft ----
+    SELECT * INTO v_draft FROM ops.deal_draft d WHERE d.draft_id = p_draft_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'draft_id % not found', p_draft_id; END IF;
+
+    -- ---- Clear prior validation results ----
+    DELETE FROM ops.validation_result vr WHERE vr.draft_id = p_draft_id;
+
+    -- ---- Lead broker check ----
+    SELECT EXISTS (
+        SELECT 1 FROM ops.deal_draft_broker b
+        WHERE b.draft_id = p_draft_id AND b.is_lead_broker = TRUE
+    ) INTO v_has_lead_broker;
+
+    IF NOT v_has_lead_broker THEN
+        INSERT INTO ops.validation_result (draft_id, rule_code, severity, field_path, validation_message)
+        VALUES (p_draft_id, 'LEAD_BROKER_REQUIRED', 'ERROR', 'ops.deal_draft_broker.is_lead_broker', 'A lead broker is required to submit.');
+        UPDATE ops.deal_draft SET draft_status = 'VALIDATION_FAILED', updated_by_identity_id = p_submitted_by_identity_id, updated_at = NOW() WHERE draft_id = p_draft_id;
+        RETURN NULL;
+    END IF;
+
+    -- ---- Doc template check ----
+    SELECT dct.doc_checklist_template_id INTO v_template_id
+    FROM config.doc_checklist_template dct
+    WHERE dct.deal_subtype_key = v_draft.deal_subtype_key AND dct.is_active = TRUE
+    ORDER BY dct.created_at DESC LIMIT 1;
+
+    IF v_template_id IS NULL THEN
+        INSERT INTO ops.validation_result (draft_id, rule_code, severity, field_path, validation_message)
+        VALUES (p_draft_id, 'DOC_TEMPLATE_MISSING', 'ERROR', 'config.doc_checklist_template', 'No active document checklist template exists for this deal subtype.');
+        UPDATE ops.deal_draft SET draft_status = 'VALIDATION_FAILED', updated_by_identity_id = p_submitted_by_identity_id, updated_at = NOW() WHERE draft_id = p_draft_id;
+        RETURN NULL;
+    END IF;
+
+    -- ---- FICA requirement ----
+    SELECT (v_draft.is_jse_listed OR EXISTS (
+        SELECT 1 FROM ops.deal_draft_party p WHERE p.draft_id = p_draft_id AND p.requires_fica = TRUE
+    )) INTO v_requires_fica;
+
+    -- ---- Doc completeness check ----
+    WITH required_items AS (
+        SELECT dcti.checklist_item_key AS doc_code,
+            CASE WHEN dcti.checklist_item_key = 'FICA_COMPLETE' AND EXISTS (
+                SELECT 1 FROM config.doc_checklist_conditional_rule r
+                WHERE r.doc_checklist_template_item_id = dcti.doc_checklist_template_item_id AND r.condition_key = 'REQUIRES_FICA_OR_JSE'
+            ) THEN v_requires_fica ELSE dcti.is_required END AS is_required
+        FROM config.doc_checklist_template_item dcti WHERE dcti.doc_checklist_template_id = v_template_id
+    ), required_docs AS (SELECT doc_code FROM required_items WHERE is_required = TRUE)
+    SELECT
+        (SELECT COUNT(*) FROM required_docs rd LEFT JOIN ops.deal_draft_doc_status ds ON ds.draft_id = p_draft_id AND ds.doc_code = rd.doc_code WHERE ds.draft_doc_status_id IS NULL),
+        (SELECT COUNT(*) FROM required_docs rd JOIN ops.deal_draft_doc_status ds ON ds.draft_id = p_draft_id AND ds.doc_code = rd.doc_code
+         WHERE ds.is_confirmed = FALSE AND COALESCE(ds.is_overridden, FALSE) = FALSE)
+    INTO v_missing_required_docs, v_unconfirmed_required_docs;
+
+    IF v_missing_required_docs > 0 THEN
+        INSERT INTO ops.validation_result (draft_id, rule_code, severity, field_path, validation_message)
+        SELECT p_draft_id, 'DOC_REQUIRED', 'ERROR', 'ops.deal_draft_doc_status.' || rd.doc_code, 'Document ' || rd.doc_code || ' is required.'
+        FROM (
+            WITH required_items AS (
+                SELECT dcti.checklist_item_key AS doc_code,
+                    CASE WHEN dcti.checklist_item_key = 'FICA_COMPLETE' AND EXISTS (
+                        SELECT 1 FROM config.doc_checklist_conditional_rule r
+                        WHERE r.doc_checklist_template_item_id = dcti.doc_checklist_template_item_id AND r.condition_key = 'REQUIRES_FICA_OR_JSE'
+                    ) THEN v_requires_fica ELSE dcti.is_required END AS is_required
+                FROM config.doc_checklist_template_item dcti WHERE dcti.doc_checklist_template_id = v_template_id
+            ) SELECT doc_code FROM required_items WHERE is_required = TRUE
+        ) rd LEFT JOIN ops.deal_draft_doc_status ds ON ds.draft_id = p_draft_id AND ds.doc_code = rd.doc_code
+        WHERE ds.draft_doc_status_id IS NULL;
+    END IF;
+
+    IF v_unconfirmed_required_docs > 0 THEN
+        INSERT INTO ops.validation_result (draft_id, rule_code, severity, field_path, validation_message)
+        SELECT p_draft_id, 'DOC_NOT_CONFIRMED', 'ERROR', 'ops.deal_draft_doc_status.' || ds.doc_code, 'Document ' || ds.doc_code || ' is not confirmed.'
+        FROM ops.deal_draft_doc_status ds
+        WHERE ds.draft_id = p_draft_id AND ds.is_confirmed = FALSE AND COALESCE(ds.is_overridden, FALSE) = FALSE
+          AND EXISTS (
+              WITH required_items AS (
+                  SELECT dcti.checklist_item_key AS doc_code,
+                      CASE WHEN dcti.checklist_item_key = 'FICA_COMPLETE' AND EXISTS (
+                          SELECT 1 FROM config.doc_checklist_conditional_rule r
+                          WHERE r.doc_checklist_template_item_id = dcti.doc_checklist_template_item_id AND r.condition_key = 'REQUIRES_FICA_OR_JSE'
+                      ) THEN v_requires_fica ELSE dcti.is_required END AS is_required
+                  FROM config.doc_checklist_template_item dcti WHERE dcti.doc_checklist_template_id = v_template_id
+              ) SELECT 1 FROM required_items ri WHERE ri.is_required = TRUE AND ri.doc_code = ds.doc_code
+          );
+    END IF;
+
+    IF (v_missing_required_docs + v_unconfirmed_required_docs) > 0 THEN
+        UPDATE ops.deal_draft SET draft_status = 'VALIDATION_FAILED', updated_by_identity_id = p_submitted_by_identity_id, updated_at = NOW() WHERE draft_id = p_draft_id;
+        RETURN NULL;
+    END IF;
+
+    -- ---- Economics check ----
+    IF NOT EXISTS (SELECT 1 FROM ops.deal_draft_economics e WHERE e.draft_id = p_draft_id) THEN
+        INSERT INTO ops.validation_result (draft_id, rule_code, severity, field_path, validation_message)
+        VALUES (p_draft_id, 'ECONOMICS_REQUIRED', 'ERROR', 'ops.deal_draft_economics', 'Economics are required to submit.');
+        UPDATE ops.deal_draft SET draft_status = 'VALIDATION_FAILED', updated_by_identity_id = p_submitted_by_identity_id, updated_at = NOW() WHERE draft_id = p_draft_id;
+        RETURN NULL;
+    END IF;
+
+    -- ---- Create/resolve deal ----
+    v_business_key := COALESCE(v_draft.deal_business_key, 'DRAFT-' || p_draft_id::text);
+    INSERT INTO core.deal (deal_business_key, created_by_identity_id)
+    VALUES (v_business_key, p_submitted_by_identity_id) ON CONFLICT (deal_business_key) DO NOTHING;
+    SELECT d.deal_id INTO v_deal_id FROM core.deal d WHERE d.deal_business_key = v_business_key;
+
+    -- ---- Version numbering ----
+    SELECT dv.deal_version_id, dv.version_major, dv.version_minor
+    INTO v_prev_deal_version_id, v_prev_major, v_prev_minor
+    FROM core.deal_version dv WHERE dv.deal_id = v_deal_id AND dv.is_current = TRUE
+    ORDER BY dv.version_major DESC, dv.version_minor DESC LIMIT 1;
+
+    IF v_prev_deal_version_id IS NULL THEN
+        v_new_major := 1; v_new_minor := 0;
+    ELSE
+        v_new_major := v_prev_major; v_new_minor := v_prev_minor + 1;
+        UPDATE core.deal_version SET is_current = FALSE WHERE deal_id = v_deal_id AND is_current = TRUE;
+    END IF;
+
+    -- ---- Insert deal_version (V009 + V010 columns) ----
+    INSERT INTO core.deal_version (
+        deal_id, version_major, version_minor, is_current, lifecycle_status,
+        current_gate_key, submitted_from_draft_id, previous_deal_version_id,
+        promoted_by_identity_id, promoted_at, is_jse_listed,
+        deal_subtype_key, deal_name, deal_family,
+        estimated_deadline, division_key
+    ) VALUES (
+        v_deal_id, v_new_major, v_new_minor, TRUE, 'SUBMITTED', 'G1',
+        p_draft_id, v_prev_deal_version_id, p_submitted_by_identity_id, NOW(),
+        v_draft.is_jse_listed, v_draft.deal_subtype_key,
+        v_draft.deal_name, v_draft.deal_family,
+        v_draft.estimated_deadline, v_draft.division_key
+    ) RETURNING deal_version_id INTO v_new_deal_version_id;
+
+    PERFORM core.materialize_approval_requirements(v_new_deal_version_id, 'G1', 'DEFAULT_GATES_0_3');
+
+    -- ---- Snapshot parties (V009 + V010 legal_name) ----
+    INSERT INTO core.deal_version_party (
+        deal_version_id, party_role_key, party_name, party_email, party_phone,
+        requires_fica, legal_name, trading_name, registration_number, vat_number,
+        jse_listed, address_line1, address_line2, address_line3, address_line4,
+        contact_name, contact_number, contact_email,
+        invoicing_instructions, lead_source, lead_rebase_link
+    )
+    SELECT v_new_deal_version_id, p.party_role_key, p.party_name, p.party_email, p.party_phone,
+        p.requires_fica, p.legal_name, p.trading_name, p.registration_number, p.vat_number,
+        p.jse_listed, p.address_line1, p.address_line2, p.address_line3, p.address_line4,
+        p.contact_name, p.contact_number, p.contact_email,
+        p.invoicing_instructions, p.lead_source, p.lead_rebase_link
+    FROM ops.deal_draft_party p WHERE p.draft_id = p_draft_id;
+
+    -- ---- Snapshot brokers (V009 + V010 extensions) ----
+    INSERT INTO core.deal_version_broker (
+        deal_version_id, broker_identity_id, broker_external_ref,
+        is_lead_broker, split_percent,
+        role_instance_id, broker_slot, division_key,
+        role_on_deal, participant_type, commission_pct,
+        commission_override_pct, override_reason
+    )
+    SELECT v_new_deal_version_id, b.broker_identity_id, b.broker_external_ref,
+        b.is_lead_broker, b.split_percent,
+        b.role_instance_id, b.broker_slot, b.division_key,
+        b.role_on_deal, b.participant_type, b.commission_pct,
+        b.commission_override_pct, b.override_reason
+    FROM ops.deal_draft_broker b WHERE b.draft_id = p_draft_id;
+
+    -- ---- Snapshot economics (V009 columns) ----
+    INSERT INTO core.deal_version_economics (
+        deal_version_id, gross_billings, commission_total,
+        company_split_pct, broker_split_pct, economics_payload,
+        purchase_price, commission_pct, due_diligence_end_date, deposit_due_date,
+        settlement_terms, payment_due_date_1, payment_due_date_2,
+        payment_due_date_3, payment_due_date_4,
+        invoice_reference, invoice_contact_person, invoice_contact_number,
+        invoice_additional_instructions
+    )
+    SELECT v_new_deal_version_id, e.gross_billings, e.commission_total,
+        e.company_split_pct, e.broker_split_pct, e.economics_payload,
+        e.purchase_price, e.commission_pct, e.due_diligence_end_date, e.deposit_due_date,
+        e.settlement_terms, e.payment_due_date_1, e.payment_due_date_2,
+        e.payment_due_date_3, e.payment_due_date_4,
+        e.invoice_reference, e.invoice_contact_person, e.invoice_contact_number,
+        e.invoice_additional_instructions
+    FROM ops.deal_draft_economics e WHERE e.draft_id = p_draft_id;
+
+    -- ---- Snapshot property (V009 + V010 parking_bays/payload) ----
+    INSERT INTO core.deal_version_property_detail (
+        deal_version_id, premises_name, property_name,
+        property_address_line1, property_address_line2,
+        property_address_line3, property_address_line4,
+        gla_sqm, property_type, property_grade,
+        property_source, property_listing_broker, property_rebase_link,
+        parking_bays, property_payload
+    )
+    SELECT v_new_deal_version_id, pp.premises_name, pp.property_name,
+        pp.property_address_line1, pp.property_address_line2,
+        pp.property_address_line3, pp.property_address_line4,
+        pp.gla_sqm, pp.property_type, pp.property_grade,
+        pp.property_source, pp.property_listing_broker, pp.property_rebase_link,
+        pp.parking_bays, pp.property_payload
+    FROM ops.deal_draft_property pp WHERE pp.draft_id = p_draft_id;
+
+    -- ---- Snapshot external referral (V009) ----
+    INSERT INTO core.deal_version_external_referral (
+        deal_version_id, entity_name, contact_name, contact_email, split_of_gross_deal
+    )
+    SELECT v_new_deal_version_id, er.entity_name, er.contact_name, er.contact_email, er.split_of_gross_deal
+    FROM ops.deal_draft_external_referral er WHERE er.draft_id = p_draft_id;
+
+    -- ---- Snapshot milestones (V010 — new) ----
+    INSERT INTO core.deal_version_milestone (
+        deal_version_id, milestone_key, milestone_date, milestone_note
+    )
+    SELECT v_new_deal_version_id, ms.milestone_key, ms.milestone_date, ms.milestone_note
+    FROM ops.deal_draft_milestone ms WHERE ms.draft_id = p_draft_id;
+
+    -- ---- Snapshot doc checklist (V009 + V010 override fields) ----
+    WITH template_items AS (
+        SELECT dcti.doc_checklist_template_item_id, dcti.checklist_item_key AS doc_code,
+            CASE WHEN dcti.checklist_item_key = 'FICA_COMPLETE' AND EXISTS (
+                SELECT 1 FROM config.doc_checklist_conditional_rule r
+                WHERE r.doc_checklist_template_item_id = dcti.doc_checklist_template_item_id AND r.condition_key = 'REQUIRES_FICA_OR_JSE'
+            ) THEN v_requires_fica ELSE dcti.is_required END AS is_required
+        FROM config.doc_checklist_template_item dcti WHERE dcti.doc_checklist_template_id = v_template_id
+    )
+    INSERT INTO core.deal_version_doc_checklist_status (
+        deal_version_id, doc_checklist_template_item_id, doc_code,
+        is_required, is_confirmed, note,
+        is_overridden, override_reason, file_reference
+    )
+    SELECT v_new_deal_version_id, ti.doc_checklist_template_item_id, ti.doc_code,
+        ti.is_required, COALESCE(ds.is_confirmed, FALSE), ds.note,
+        COALESCE(ds.is_overridden, FALSE), ds.override_reason, ds.file_reference
+    FROM template_items ti
+    LEFT JOIN ops.deal_draft_doc_status ds ON ds.draft_id = p_draft_id AND ds.doc_code = ti.doc_code;
+
+    -- ---- Audit events ----
+    INSERT INTO audit.event_log (deal_id, deal_version_id, event_type, gate_key, actor_identity_id, event_payload)
+    VALUES (v_deal_id, v_new_deal_version_id, 'PROMOTED', 'G0', p_submitted_by_identity_id, jsonb_build_object('draft_id', p_draft_id));
+
+    INSERT INTO audit.event_log (deal_id, deal_version_id, event_type, gate_key, actor_identity_id, event_payload)
+    VALUES (v_deal_id, v_new_deal_version_id, 'G1_ENTERED', 'G1', p_submitted_by_identity_id, '{}'::jsonb);
+
+    UPDATE ops.deal_draft SET draft_status = 'SUBMITTED', submitted_at = NOW(),
+        updated_by_identity_id = p_submitted_by_identity_id, updated_at = NOW()
+    WHERE draft_id = p_draft_id;
+
+    RETURN v_new_deal_version_id;
+END;
+$$;
+
+-- =========================================================================
+-- SECTION 2 — Updated create_draft_from_deal_version
+-- =========================================================================
+CREATE OR REPLACE FUNCTION ops.create_draft_from_deal_version(
+    p_source_deal_version_id BIGINT,
+    p_created_by_identity_id BIGINT,
+    p_new_business_key TEXT DEFAULT NULL
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_source core.deal_version%ROWTYPE;
+    v_source_business_key TEXT;
+    v_new_draft_id BIGINT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM security.identity i WHERE i.identity_id = p_created_by_identity_id) THEN
+        RAISE EXCEPTION 'created_by_identity_id % does not exist', p_created_by_identity_id;
+    END IF;
+
+    SELECT dv.* INTO v_source FROM core.deal_version dv WHERE dv.deal_version_id = p_source_deal_version_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'deal_version_id % not found', p_source_deal_version_id; END IF;
+
+    SELECT d.deal_business_key INTO v_source_business_key FROM core.deal d WHERE d.deal_id = v_source.deal_id;
+
+    INSERT INTO ops.deal_draft (
+        deal_business_key, deal_subtype_key, deal_name, deal_family,
+        division_key, estimated_deadline,
+        draft_status, current_gate_key,
+        created_by_identity_id, updated_by_identity_id,
+        source_deal_version_id, is_jse_listed
+    ) VALUES (
+        COALESCE(NULLIF(p_new_business_key, ''), v_source_business_key),
+        COALESCE(v_source.deal_subtype_key, 'LEASE_ACQUISITION_OR_RENEWAL'),
+        v_source.deal_name, v_source.deal_family,
+        v_source.division_key, v_source.estimated_deadline,
+        'DRAFT', 'G0', p_created_by_identity_id, p_created_by_identity_id,
+        p_source_deal_version_id, COALESCE(v_source.is_jse_listed, FALSE)
+    ) RETURNING draft_id INTO v_new_draft_id;
+
+    -- Parties
+    INSERT INTO ops.deal_draft_party (
+        draft_id, party_role_key, party_name, party_email, party_phone,
+        is_primary, requires_fica, legal_name, trading_name,
+        registration_number, vat_number, jse_listed,
+        address_line1, address_line2, address_line3, address_line4,
+        contact_name, contact_number, contact_email,
+        invoicing_instructions, lead_source, lead_rebase_link
+    )
+    SELECT v_new_draft_id, p.party_role_key, p.party_name, p.party_email, p.party_phone,
+        FALSE, COALESCE(p.requires_fica, FALSE), p.legal_name, p.trading_name,
+        p.registration_number, p.vat_number, COALESCE(p.jse_listed, FALSE),
+        p.address_line1, p.address_line2, p.address_line3, p.address_line4,
+        p.contact_name, p.contact_number, p.contact_email,
+        p.invoicing_instructions, p.lead_source, p.lead_rebase_link
+    FROM core.deal_version_party p WHERE p.deal_version_id = p_source_deal_version_id;
+
+    -- Brokers
+    INSERT INTO ops.deal_draft_broker (
+        draft_id, broker_identity_id, broker_external_ref,
+        is_lead_broker, split_percent,
+        role_instance_id, broker_slot, division_key,
+        role_on_deal, participant_type, commission_pct,
+        commission_override_pct, override_reason
+    )
+    SELECT v_new_draft_id, b.broker_identity_id, b.broker_external_ref,
+        b.is_lead_broker, b.split_percent,
+        b.role_instance_id, b.broker_slot, b.division_key,
+        b.role_on_deal, b.participant_type, b.commission_pct,
+        b.commission_override_pct, b.override_reason
+    FROM core.deal_version_broker b WHERE b.deal_version_id = p_source_deal_version_id;
+
+    -- Economics
+    INSERT INTO ops.deal_draft_economics (
+        draft_id, gross_billings, commission_total,
+        company_split_pct, broker_split_pct, economics_payload,
+        purchase_price, commission_pct, due_diligence_end_date, deposit_due_date,
+        settlement_terms, payment_due_date_1, payment_due_date_2,
+        payment_due_date_3, payment_due_date_4,
+        invoice_reference, invoice_contact_person, invoice_contact_number,
+        invoice_additional_instructions
+    )
+    SELECT v_new_draft_id, e.gross_billings, e.commission_total,
+        e.company_split_pct, e.broker_split_pct, e.economics_payload,
+        e.purchase_price, e.commission_pct, e.due_diligence_end_date, e.deposit_due_date,
+        e.settlement_terms, e.payment_due_date_1, e.payment_due_date_2,
+        e.payment_due_date_3, e.payment_due_date_4,
+        e.invoice_reference, e.invoice_contact_person, e.invoice_contact_number,
+        e.invoice_additional_instructions
+    FROM core.deal_version_economics e WHERE e.deal_version_id = p_source_deal_version_id;
+
+    -- Docs (with override fields)
+    INSERT INTO ops.deal_draft_doc_status (
+        draft_id, doc_checklist_template_item_id, doc_code,
+        is_confirmed, note, is_overridden, override_reason, file_reference,
+        confirmed_by_identity_id, confirmed_at
+    )
+    SELECT v_new_draft_id, s.doc_checklist_template_item_id, s.doc_code,
+        s.is_confirmed, s.note, COALESCE(s.is_overridden, FALSE), s.override_reason, s.file_reference,
+        p_created_by_identity_id, CASE WHEN s.is_confirmed THEN NOW() ELSE NULL END
+    FROM core.deal_version_doc_checklist_status s WHERE s.deal_version_id = p_source_deal_version_id;
+
+    -- Property
+    INSERT INTO ops.deal_draft_property (
+        draft_id, premises_name, property_name,
+        property_address_line1, property_address_line2,
+        property_address_line3, property_address_line4,
+        gla_sqm, property_type, property_grade,
+        property_source, property_listing_broker, property_rebase_link,
+        parking_bays, property_payload
+    )
+    SELECT v_new_draft_id, pr.premises_name, pr.property_name,
+        pr.property_address_line1, pr.property_address_line2,
+        pr.property_address_line3, pr.property_address_line4,
+        pr.gla_sqm, pr.property_type, pr.property_grade,
+        pr.property_source, pr.property_listing_broker, pr.property_rebase_link,
+        pr.parking_bays, pr.property_payload
+    FROM core.deal_version_property_detail pr WHERE pr.deal_version_id = p_source_deal_version_id;
+
+    -- External referral
+    INSERT INTO ops.deal_draft_external_referral (
+        draft_id, entity_name, contact_name, contact_email, split_of_gross_deal
+    )
+    SELECT v_new_draft_id, er.entity_name, er.contact_name, er.contact_email, er.split_of_gross_deal
+    FROM core.deal_version_external_referral er WHERE er.deal_version_id = p_source_deal_version_id;
+
+    -- Milestones
+    INSERT INTO ops.deal_draft_milestone (draft_id, milestone_key, milestone_date, milestone_note)
+    SELECT v_new_draft_id, ms.milestone_key, ms.milestone_date, ms.milestone_note
+    FROM core.deal_version_milestone ms WHERE ms.deal_version_id = p_source_deal_version_id;
+
+    -- Audit
+    INSERT INTO audit.event_log (deal_id, deal_version_id, event_type, gate_key, actor_identity_id, event_payload)
+    VALUES (v_source.deal_id, p_source_deal_version_id, 'DRAFT_INHERITED', 'G0', p_created_by_identity_id,
+            jsonb_build_object('source_deal_version_id', p_source_deal_version_id, 'new_draft_id', v_new_draft_id));
+
+    RETURN v_new_draft_id;
+END;
+$$;
+
+-- =========================================================================
+-- SECTION 3 — Updated hash function (include milestones)
+-- =========================================================================
+CREATE OR REPLACE FUNCTION api._compute_draft_hash(p_draft_id BIGINT)
+RETURNS TEXT LANGUAGE sql STABLE AS $$
+    SELECT md5(
+        COALESCE((SELECT row_to_json(d.*)::text FROM ops.deal_draft d WHERE d.draft_id = p_draft_id), '') ||
+        COALESCE((SELECT string_agg(row_to_json(p.*)::text, '|' ORDER BY p.draft_party_id) FROM ops.deal_draft_party p WHERE p.draft_id = p_draft_id), '') ||
+        COALESCE((SELECT row_to_json(e.*)::text FROM ops.deal_draft_economics e WHERE e.draft_id = p_draft_id), '') ||
+        COALESCE((SELECT string_agg(row_to_json(b.*)::text, '|' ORDER BY b.draft_broker_id) FROM ops.deal_draft_broker b WHERE b.draft_id = p_draft_id), '') ||
+        COALESCE((SELECT string_agg(row_to_json(ds.*)::text, '|' ORDER BY ds.draft_doc_status_id) FROM ops.deal_draft_doc_status ds WHERE ds.draft_id = p_draft_id), '') ||
+        COALESCE((SELECT row_to_json(pr.*)::text FROM ops.deal_draft_property pr WHERE pr.draft_id = p_draft_id), '') ||
+        COALESCE((SELECT row_to_json(er.*)::text FROM ops.deal_draft_external_referral er WHERE er.draft_id = p_draft_id), '') ||
+        COALESCE((SELECT string_agg(row_to_json(ms.*)::text, '|' ORDER BY ms.milestone_key) FROM ops.deal_draft_milestone ms WHERE ms.draft_id = p_draft_id), '')
+    );
+$$;
+
+-- =========================================================================
+-- SECTION 4 — Security hardening
+-- =========================================================================
+ALTER FUNCTION ops.promote_draft_to_core(BIGINT, BIGINT) SECURITY DEFINER;
+ALTER FUNCTION ops.promote_draft_to_core(BIGINT, BIGINT) SET search_path = pg_catalog, raw, ops, core, audit, config, security, public;
+ALTER FUNCTION ops.create_draft_from_deal_version(BIGINT, BIGINT, TEXT) SECURITY DEFINER;
+ALTER FUNCTION ops.create_draft_from_deal_version(BIGINT, BIGINT, TEXT) SET search_path = pg_catalog, raw, ops, core, audit, config, security, public;
+ALTER FUNCTION api._compute_draft_hash(BIGINT) SECURITY DEFINER;
+ALTER FUNCTION api._compute_draft_hash(BIGINT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+GRANT EXECUTE ON FUNCTION ops.promote_draft_to_core(BIGINT, BIGINT) TO app_ops;
+GRANT EXECUTE ON FUNCTION ops.create_draft_from_deal_version(BIGINT, BIGINT, TEXT) TO app_ops;
+
+COMMIT;
