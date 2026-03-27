@@ -1,0 +1,566 @@
+BEGIN;
+
+-- =========================================================================
+-- V010 — UI Contract Alignment (Additive to V009)
+--
+-- V009 already provides: party extensions, property tables, broker
+-- extensions (role_instance_id, broker_slot, division_key), external
+-- referral tables, invoice/settlement fields on economics, deal_name,
+-- deal_family, computed economics functions, promotion function rewrite,
+-- and API views/upserts for property and external referral.
+--
+-- This migration adds ONLY what V009 does not cover:
+--   1.  Role key reconciliation (DIVISION_HEAD ↔ DIV_APPROVER etc)
+--   2.  Party: legal_name column (missing from V009)
+--   3.  Deal draft header: estimated_deadline, division_key
+--   4.  Deal version: estimated_deadline, division_key
+--   5.  Broker: role_on_deal, participant_type, commission_pct,
+--       commission_override_pct, override_reason
+--   6.  Document: is_overridden, override_reason, file_reference
+--   7.  Milestone table (new)
+--   8.  API: delete functions, cancel draft, update party, pipeline summary
+--   9.  Audit trigger fix (workflow_run)
+--  10.  Security grants
+--
+-- Naming convention: follows V009 patterns (address_line1 not address_line_1,
+-- lead_source not party_source, property_listing_broker not listing_broker_ref).
+-- =========================================================================
+
+-- -------------------------------------------------------------------------
+-- 0. Idempotent role guards
+-- -------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_ops') THEN CREATE ROLE app_ops NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_finance') THEN CREATE ROLE app_finance NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_broker') THEN CREATE ROLE app_broker NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_ui') THEN CREATE ROLE app_ui NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_system') THEN CREATE ROLE app_system NOLOGIN; END IF;
+END;
+$$;
+
+-- =========================================================================
+-- SECTION 1 — Role key reconciliation
+-- =========================================================================
+-- The approval engine (V004/V005/V007) hardcodes DIVISION_HEAD, BROKER, OPS.
+-- The org workbook (S004) uses DIV_APPROVER, DEAL_MAKER, OPS_MANAGER.
+-- Strategy: keep both in role_catalog; dual-assign users so approval
+-- rules and RLS work without modifying the hardcoded functions.
+
+INSERT INTO config.role_catalog (role_key, role_name, role_type, role_scope)
+VALUES
+    ('DIVISION_HEAD', 'Divisional Head (Approval Alias)', 'APPROVAL', 'Gate 2 approval engine'),
+    ('BROKER',        'Broker (Approval Alias)',          'PARTICIPANT', 'Deal participation and RLS'),
+    ('OPS',           'Operations (Task Alias)',           'APPLICATION', 'Task list visibility')
+ON CONFLICT (role_key) DO UPDATE
+SET role_scope = EXCLUDED.role_scope;
+
+-- Grant DIVISION_HEAD alias to all users who have DIV_APPROVER
+INSERT INTO security.role_assignment (identity_id, role_key, assigned_at)
+SELECT ra.identity_id, 'DIVISION_HEAD', NOW()
+FROM security.role_assignment ra
+WHERE ra.role_key = 'DIV_APPROVER'
+  AND NOT EXISTS (
+      SELECT 1 FROM security.role_assignment ra2
+      WHERE ra2.identity_id = ra.identity_id AND ra2.role_key = 'DIVISION_HEAD'
+  );
+
+-- Grant BROKER alias to all users who have DEAL_MAKER
+INSERT INTO security.role_assignment (identity_id, role_key, assigned_at)
+SELECT ra.identity_id, 'BROKER', NOW()
+FROM security.role_assignment ra
+WHERE ra.role_key = 'DEAL_MAKER'
+  AND NOT EXISTS (
+      SELECT 1 FROM security.role_assignment ra2
+      WHERE ra2.identity_id = ra.identity_id AND ra2.role_key = 'BROKER'
+  );
+
+-- Grant OPS alias to all users who have OPS_MANAGER
+INSERT INTO security.role_assignment (identity_id, role_key, assigned_at)
+SELECT ra.identity_id, 'OPS', NOW()
+FROM security.role_assignment ra
+WHERE ra.role_key = 'OPS_MANAGER'
+  AND NOT EXISTS (
+      SELECT 1 FROM security.role_assignment ra2
+      WHERE ra2.identity_id = ra.identity_id AND ra2.role_key = 'OPS'
+  );
+
+-- =========================================================================
+-- SECTION 2 — Party: legal_name (V009 missed this)
+-- =========================================================================
+ALTER TABLE ops.deal_draft_party
+    ADD COLUMN IF NOT EXISTS legal_name TEXT;
+
+ALTER TABLE core.deal_version_party
+    ADD COLUMN IF NOT EXISTS legal_name TEXT;
+
+-- =========================================================================
+-- SECTION 3 — Deal draft header extensions (not in V009)
+-- =========================================================================
+ALTER TABLE ops.deal_draft
+    ADD COLUMN IF NOT EXISTS estimated_deadline DATE,
+    ADD COLUMN IF NOT EXISTS division_key TEXT;
+
+-- =========================================================================
+-- SECTION 4 — Deal version extensions (not in V009)
+-- =========================================================================
+ALTER TABLE core.deal_version
+    ADD COLUMN IF NOT EXISTS estimated_deadline DATE,
+    ADD COLUMN IF NOT EXISTS division_key TEXT;
+
+-- =========================================================================
+-- SECTION 5 — Broker extensions beyond V009
+-- =========================================================================
+-- V009 already adds: role_instance_id, broker_slot, division_key
+-- We add: role_on_deal, participant_type, commission_pct,
+--          commission_override_pct, override_reason
+ALTER TABLE ops.deal_draft_broker
+    ADD COLUMN IF NOT EXISTS role_on_deal TEXT,
+    ADD COLUMN IF NOT EXISTS participant_type TEXT DEFAULT 'INTERNAL',
+    ADD COLUMN IF NOT EXISTS commission_pct NUMERIC(7, 4),
+    ADD COLUMN IF NOT EXISTS commission_override_pct NUMERIC(7, 4),
+    ADD COLUMN IF NOT EXISTS override_reason TEXT;
+
+ALTER TABLE core.deal_version_broker
+    ADD COLUMN IF NOT EXISTS role_on_deal TEXT,
+    ADD COLUMN IF NOT EXISTS participant_type TEXT DEFAULT 'INTERNAL',
+    ADD COLUMN IF NOT EXISTS commission_pct NUMERIC(7, 4),
+    ADD COLUMN IF NOT EXISTS commission_override_pct NUMERIC(7, 4),
+    ADD COLUMN IF NOT EXISTS override_reason TEXT;
+
+-- =========================================================================
+-- SECTION 6 — Document override fields (not in V009)
+-- =========================================================================
+ALTER TABLE ops.deal_draft_doc_status
+    ADD COLUMN IF NOT EXISTS is_overridden BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS override_reason TEXT,
+    ADD COLUMN IF NOT EXISTS file_reference TEXT;
+
+ALTER TABLE core.deal_version_doc_checklist_status
+    ADD COLUMN IF NOT EXISTS is_overridden BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS override_reason TEXT,
+    ADD COLUMN IF NOT EXISTS file_reference TEXT;
+
+-- =========================================================================
+-- SECTION 7 — Deal milestones (not in V009)
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS ops.deal_draft_milestone (
+    draft_milestone_id BIGSERIAL PRIMARY KEY,
+    draft_id BIGINT NOT NULL REFERENCES ops.deal_draft (draft_id) ON DELETE CASCADE,
+    milestone_key TEXT NOT NULL,
+    milestone_date DATE,
+    milestone_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (draft_id, milestone_key)
+);
+
+CREATE TABLE IF NOT EXISTS core.deal_version_milestone (
+    deal_version_milestone_id BIGSERIAL PRIMARY KEY,
+    deal_version_id BIGINT NOT NULL REFERENCES core.deal_version (deal_version_id) ON DELETE CASCADE,
+    milestone_key TEXT NOT NULL,
+    milestone_date DATE,
+    milestone_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (deal_version_id, milestone_key)
+);
+
+-- =========================================================================
+-- SECTION 8 — Property table extensions (V009 table exists, add missing cols)
+-- =========================================================================
+ALTER TABLE ops.deal_draft_property
+    ADD COLUMN IF NOT EXISTS parking_bays INTEGER,
+    ADD COLUMN IF NOT EXISTS property_payload JSONB NOT NULL DEFAULT '{}'::JSONB,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE core.deal_version_property_detail
+    ADD COLUMN IF NOT EXISTS parking_bays INTEGER,
+    ADD COLUMN IF NOT EXISTS property_payload JSONB NOT NULL DEFAULT '{}'::JSONB;
+
+-- =========================================================================
+-- SECTION 9 — API surface: updated views
+-- =========================================================================
+
+-- Updated draft header view (add V010 columns)
+CREATE OR REPLACE VIEW api.v_ops_draft_header AS
+SELECT
+    d.draft_id,
+    d.deal_business_key,
+    d.deal_name,
+    d.deal_family,
+    d.variant_key,
+    d.deal_subtype_key,
+    d.draft_status,
+    d.current_gate_key,
+    d.is_jse_listed,
+    d.division_key,
+    d.estimated_deadline,
+    d.source_deal_version_id,
+    d.submitted_at,
+    d.created_by_identity_id,
+    d.updated_by_identity_id,
+    d.created_at,
+    d.updated_at
+FROM ops.deal_draft d;
+
+-- Updated draft parties view (add legal_name)
+CREATE OR REPLACE VIEW api.v_ops_draft_parties AS
+SELECT
+    p.draft_party_id,
+    p.draft_id,
+    p.party_role_key,
+    p.party_name,
+    p.legal_name,
+    p.trading_name,
+    p.registration_number,
+    p.vat_number,
+    p.jse_listed,
+    p.address_line1,
+    p.address_line2,
+    p.address_line3,
+    p.address_line4,
+    p.contact_name,
+    p.contact_number,
+    p.contact_email,
+    p.party_email,
+    p.party_phone,
+    p.is_primary,
+    p.requires_fica,
+    p.invoicing_instructions,
+    p.lead_source,
+    p.listing_broker_ref,
+    p.lead_rebase_link,
+    p.created_at
+FROM ops.deal_draft_party p;
+
+-- Updated draft brokers view (add V010 columns)
+CREATE OR REPLACE VIEW api.v_ops_draft_brokers AS
+SELECT
+    b.draft_broker_id,
+    b.draft_id,
+    b.broker_identity_id,
+    b.broker_external_ref,
+    b.is_lead_broker,
+    b.split_percent,
+    b.role_instance_id,
+    b.broker_slot,
+    b.division_key,
+    b.role_on_deal,
+    b.participant_type,
+    b.commission_pct,
+    b.commission_override_pct,
+    b.override_reason,
+    b.created_at
+FROM ops.deal_draft_broker b;
+
+-- Updated docs view (add override fields)
+CREATE OR REPLACE VIEW api.v_ops_draft_docs AS
+SELECT
+    ds.draft_doc_status_id,
+    ds.draft_id,
+    ds.doc_checklist_template_item_id,
+    ds.doc_code,
+    ds.is_confirmed,
+    ds.is_overridden,
+    ds.override_reason,
+    ds.file_reference,
+    ds.note,
+    ds.confirmed_by_identity_id,
+    ds.confirmed_at,
+    ds.created_at
+FROM ops.deal_draft_doc_status ds;
+
+-- Milestone view (new)
+CREATE OR REPLACE VIEW api.v_ops_draft_milestones AS
+SELECT
+    ms.draft_milestone_id,
+    ms.draft_id,
+    ms.milestone_key,
+    ms.milestone_date,
+    ms.milestone_note,
+    ms.created_at
+FROM ops.deal_draft_milestone ms;
+
+-- =========================================================================
+-- SECTION 10 — API surface: new/updated functions
+-- =========================================================================
+
+-- Delete party
+CREATE OR REPLACE FUNCTION api.ops_delete_draft_party(p_draft_party_id BIGINT)
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM ops.deal_draft_party WHERE draft_party_id = p_draft_party_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'draft_party_id % not found', p_draft_party_id; END IF;
+END;
+$$;
+
+-- Update party (partial update, preserves NULLs as "no change")
+CREATE OR REPLACE FUNCTION api.ops_update_draft_party(
+    p_draft_party_id BIGINT,
+    p_party_name TEXT DEFAULT NULL,
+    p_legal_name TEXT DEFAULT NULL,
+    p_trading_name TEXT DEFAULT NULL,
+    p_registration_number TEXT DEFAULT NULL,
+    p_vat_number TEXT DEFAULT NULL,
+    p_jse_listed BOOLEAN DEFAULT NULL,
+    p_address_line1 TEXT DEFAULT NULL,
+    p_address_line2 TEXT DEFAULT NULL,
+    p_address_line3 TEXT DEFAULT NULL,
+    p_address_line4 TEXT DEFAULT NULL,
+    p_contact_name TEXT DEFAULT NULL,
+    p_contact_number TEXT DEFAULT NULL,
+    p_contact_email TEXT DEFAULT NULL,
+    p_party_email TEXT DEFAULT NULL,
+    p_party_phone TEXT DEFAULT NULL,
+    p_is_primary BOOLEAN DEFAULT NULL,
+    p_requires_fica BOOLEAN DEFAULT NULL,
+    p_invoicing_instructions TEXT DEFAULT NULL,
+    p_lead_source TEXT DEFAULT NULL,
+    p_lead_rebase_link TEXT DEFAULT NULL
+)
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE ops.deal_draft_party SET
+        party_name             = COALESCE(p_party_name, party_name),
+        legal_name             = COALESCE(p_legal_name, legal_name),
+        trading_name           = COALESCE(p_trading_name, trading_name),
+        registration_number    = COALESCE(p_registration_number, registration_number),
+        vat_number             = COALESCE(p_vat_number, vat_number),
+        jse_listed             = COALESCE(p_jse_listed, jse_listed),
+        address_line1          = COALESCE(p_address_line1, address_line1),
+        address_line2          = COALESCE(p_address_line2, address_line2),
+        address_line3          = COALESCE(p_address_line3, address_line3),
+        address_line4          = COALESCE(p_address_line4, address_line4),
+        contact_name           = COALESCE(p_contact_name, contact_name),
+        contact_number         = COALESCE(p_contact_number, contact_number),
+        contact_email          = COALESCE(p_contact_email, contact_email),
+        party_email            = COALESCE(p_party_email, party_email),
+        party_phone            = COALESCE(p_party_phone, party_phone),
+        is_primary             = COALESCE(p_is_primary, is_primary),
+        requires_fica          = COALESCE(p_requires_fica, requires_fica),
+        invoicing_instructions = COALESCE(p_invoicing_instructions, invoicing_instructions),
+        lead_source            = COALESCE(p_lead_source, lead_source),
+        lead_rebase_link       = COALESCE(p_lead_rebase_link, lead_rebase_link)
+    WHERE draft_party_id = p_draft_party_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'draft_party_id % not found', p_draft_party_id; END IF;
+END;
+$$;
+
+-- Delete broker
+CREATE OR REPLACE FUNCTION api.ops_delete_draft_broker(p_draft_broker_id BIGINT)
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM ops.deal_draft_broker WHERE draft_broker_id = p_draft_broker_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'draft_broker_id % not found', p_draft_broker_id; END IF;
+END;
+$$;
+
+-- Delete external referral
+CREATE OR REPLACE FUNCTION api.ops_delete_draft_external_referral(p_draft_external_referral_id BIGINT)
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM ops.deal_draft_external_referral WHERE draft_external_referral_id = p_draft_external_referral_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'draft_external_referral_id % not found', p_draft_external_referral_id; END IF;
+END;
+$$;
+
+-- Milestone upsert
+CREATE OR REPLACE FUNCTION api.ops_upsert_draft_milestone(
+    p_draft_id BIGINT,
+    p_milestone_key TEXT,
+    p_milestone_date DATE DEFAULT NULL,
+    p_milestone_note TEXT DEFAULT NULL
+)
+RETURNS BIGINT LANGUAGE plpgsql AS $$
+DECLARE v_id BIGINT;
+BEGIN
+    INSERT INTO ops.deal_draft_milestone (draft_id, milestone_key, milestone_date, milestone_note)
+    VALUES (p_draft_id, p_milestone_key, p_milestone_date, p_milestone_note)
+    ON CONFLICT (draft_id, milestone_key) DO UPDATE
+    SET milestone_date = COALESCE(EXCLUDED.milestone_date, ops.deal_draft_milestone.milestone_date),
+        milestone_note = COALESCE(EXCLUDED.milestone_note, ops.deal_draft_milestone.milestone_note)
+    RETURNING draft_milestone_id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+
+-- Updated doc upsert with override fields
+CREATE OR REPLACE FUNCTION api.ops_upsert_draft_doc(
+    p_draft_id BIGINT,
+    p_doc_code TEXT,
+    p_is_confirmed BOOLEAN DEFAULT FALSE,
+    p_note TEXT DEFAULT NULL,
+    p_confirmed_by BIGINT DEFAULT NULL,
+    p_is_overridden BOOLEAN DEFAULT FALSE,
+    p_override_reason TEXT DEFAULT NULL,
+    p_file_reference TEXT DEFAULT NULL
+)
+RETURNS BIGINT LANGUAGE plpgsql AS $$
+DECLARE v_id BIGINT;
+BEGIN
+    INSERT INTO ops.deal_draft_doc_status (
+        draft_id, doc_code, is_confirmed, note, confirmed_by_identity_id, confirmed_at,
+        is_overridden, override_reason, file_reference
+    )
+    VALUES (
+        p_draft_id, p_doc_code, p_is_confirmed, p_note, p_confirmed_by,
+        CASE WHEN p_is_confirmed THEN NOW() ELSE NULL END,
+        p_is_overridden, p_override_reason, p_file_reference
+    )
+    ON CONFLICT (draft_id, doc_code) DO UPDATE
+    SET is_confirmed           = EXCLUDED.is_confirmed,
+        note                   = EXCLUDED.note,
+        confirmed_by_identity_id = EXCLUDED.confirmed_by_identity_id,
+        confirmed_at           = EXCLUDED.confirmed_at,
+        is_overridden          = EXCLUDED.is_overridden,
+        override_reason        = EXCLUDED.override_reason,
+        file_reference         = EXCLUDED.file_reference
+    RETURNING draft_doc_status_id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+
+-- Cancel draft
+CREATE OR REPLACE FUNCTION api.ops_cancel_draft(
+    p_draft_id BIGINT,
+    p_cancelled_by BIGINT
+)
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE ops.deal_draft
+    SET draft_status = 'CANCELLED',
+        updated_by_identity_id = p_cancelled_by,
+        updated_at = NOW()
+    WHERE draft_id = p_draft_id
+      AND draft_status NOT IN ('SUBMITTED', 'CANCELLED');
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'draft_id % not found or not in a cancellable state', p_draft_id;
+    END IF;
+
+    INSERT INTO audit.event_log (event_type, gate_key, actor_identity_id, event_payload)
+    VALUES ('DRAFT_CANCELLED', 'G0', p_cancelled_by, jsonb_build_object('draft_id', p_draft_id));
+END;
+$$;
+
+-- Updated create_draft (adds estimated_deadline, division_key to V009's deal_name/deal_family)
+CREATE OR REPLACE FUNCTION api.ops_create_draft(
+    p_business_key TEXT,
+    p_subtype_key TEXT,
+    p_created_by BIGINT,
+    p_deal_name TEXT DEFAULT NULL,
+    p_deal_family TEXT DEFAULT NULL,
+    p_division_key TEXT DEFAULT NULL,
+    p_estimated_deadline DATE DEFAULT NULL
+)
+RETURNS BIGINT LANGUAGE plpgsql AS $$
+DECLARE v_draft_id BIGINT;
+BEGIN
+    INSERT INTO ops.deal_draft (
+        deal_business_key, deal_subtype_key, deal_name, deal_family,
+        division_key, estimated_deadline,
+        draft_status, current_gate_key,
+        created_by_identity_id, updated_by_identity_id
+    )
+    VALUES (
+        NULLIF(btrim(p_business_key), ''), p_subtype_key, p_deal_name, p_deal_family,
+        p_division_key, p_estimated_deadline,
+        'DRAFT', 'G0', p_created_by, p_created_by
+    )
+    RETURNING draft_id INTO v_draft_id;
+
+    INSERT INTO audit.event_log (event_type, gate_key, actor_identity_id, event_payload)
+    VALUES ('DRAFT_CREATED', 'G0', p_created_by,
+            jsonb_build_object('draft_id', v_draft_id, 'deal_subtype_key', p_subtype_key, 'deal_name', p_deal_name));
+
+    RETURN v_draft_id;
+END;
+$$;
+
+-- Pipeline summary view
+CREATE OR REPLACE VIEW api.v_pipeline_summary AS
+WITH draft_stats AS (
+    SELECT d.division_key, d.draft_status, d.current_gate_key,
+           COUNT(*) AS deal_count, COALESCE(SUM(e.commission_total), 0) AS commission_total
+    FROM ops.deal_draft d
+    LEFT JOIN ops.deal_draft_economics e ON e.draft_id = d.draft_id
+    WHERE d.draft_status NOT IN ('CANCELLED')
+    GROUP BY d.division_key, d.draft_status, d.current_gate_key
+),
+version_stats AS (
+    SELECT dv.division_key, dv.lifecycle_status, dv.current_gate_key,
+           COUNT(*) AS deal_count, COALESCE(SUM(e.commission_total), 0) AS commission_total
+    FROM core.deal_version dv
+    LEFT JOIN core.deal_version_economics e ON e.deal_version_id = dv.deal_version_id
+    WHERE dv.is_current = TRUE AND dv.lifecycle_status NOT IN ('SUPERSEDED')
+    GROUP BY dv.division_key, dv.lifecycle_status, dv.current_gate_key
+)
+SELECT 'DRAFT' AS source, division_key, draft_status AS status, current_gate_key, deal_count, commission_total FROM draft_stats
+UNION ALL
+SELECT 'VERSION' AS source, division_key, lifecycle_status AS status, current_gate_key, deal_count, commission_total FROM version_stats;
+
+-- =========================================================================
+-- SECTION 11 — Audit trigger fix (workflow_run needs UPDATE)
+-- =========================================================================
+DROP TRIGGER IF EXISTS tr_workflow_run_append_only ON audit.workflow_run;
+
+CREATE OR REPLACE FUNCTION audit.prevent_delete_only()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'audit.% is append-only; DELETE is not allowed', TG_TABLE_NAME;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER tr_workflow_run_no_delete
+    BEFORE DELETE ON audit.workflow_run
+    FOR EACH ROW EXECUTE FUNCTION audit.prevent_delete_only();
+
+-- =========================================================================
+-- SECTION 12 — Security hardening
+-- =========================================================================
+ALTER FUNCTION api.ops_delete_draft_party(BIGINT) SECURITY DEFINER;
+ALTER FUNCTION api.ops_delete_draft_party(BIGINT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+ALTER FUNCTION api.ops_update_draft_party(BIGINT, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN, BOOLEAN, TEXT, TEXT, TEXT) SECURITY DEFINER;
+ALTER FUNCTION api.ops_update_draft_party(BIGINT, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN, BOOLEAN, TEXT, TEXT, TEXT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+ALTER FUNCTION api.ops_delete_draft_broker(BIGINT) SECURITY DEFINER;
+ALTER FUNCTION api.ops_delete_draft_broker(BIGINT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+ALTER FUNCTION api.ops_delete_draft_external_referral(BIGINT) SECURITY DEFINER;
+ALTER FUNCTION api.ops_delete_draft_external_referral(BIGINT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+ALTER FUNCTION api.ops_upsert_draft_milestone(BIGINT, TEXT, DATE, TEXT) SECURITY DEFINER;
+ALTER FUNCTION api.ops_upsert_draft_milestone(BIGINT, TEXT, DATE, TEXT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+ALTER FUNCTION api.ops_upsert_draft_doc(BIGINT, TEXT, BOOLEAN, TEXT, BIGINT, BOOLEAN, TEXT, TEXT) SECURITY DEFINER;
+ALTER FUNCTION api.ops_upsert_draft_doc(BIGINT, TEXT, BOOLEAN, TEXT, BIGINT, BOOLEAN, TEXT, TEXT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+ALTER FUNCTION api.ops_cancel_draft(BIGINT, BIGINT) SECURITY DEFINER;
+ALTER FUNCTION api.ops_cancel_draft(BIGINT, BIGINT) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+ALTER FUNCTION api.ops_create_draft(TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, DATE) SECURITY DEFINER;
+ALTER FUNCTION api.ops_create_draft(TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, DATE) SET search_path = pg_catalog, api, raw, ops, core, audit, config, security, public;
+
+-- =========================================================================
+-- SECTION 13 — Grants
+-- =========================================================================
+GRANT SELECT ON api.v_ops_draft_milestones TO app_ops, app_ui, app_system;
+GRANT SELECT ON api.v_pipeline_summary TO app_ops, app_finance, app_system;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ops.deal_draft_milestone TO app_ops;
+GRANT USAGE, SELECT ON SEQUENCE ops.deal_draft_milestone_draft_milestone_id_seq TO app_ops, app_system;
+GRANT SELECT ON core.deal_version_milestone TO app_finance, app_system;
+
+GRANT EXECUTE ON FUNCTION api.ops_delete_draft_party(BIGINT) TO app_ops, app_system;
+GRANT EXECUTE ON FUNCTION api.ops_update_draft_party(BIGINT, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN, BOOLEAN, TEXT, TEXT, TEXT) TO app_ops, app_system;
+GRANT EXECUTE ON FUNCTION api.ops_delete_draft_broker(BIGINT) TO app_ops, app_system;
+GRANT EXECUTE ON FUNCTION api.ops_delete_draft_external_referral(BIGINT) TO app_ops, app_system;
+GRANT EXECUTE ON FUNCTION api.ops_upsert_draft_milestone(BIGINT, TEXT, DATE, TEXT) TO app_ops, app_system;
+GRANT EXECUTE ON FUNCTION api.ops_upsert_draft_doc(BIGINT, TEXT, BOOLEAN, TEXT, BIGINT, BOOLEAN, TEXT, TEXT) TO app_ops, app_system;
+GRANT EXECUTE ON FUNCTION api.ops_cancel_draft(BIGINT, BIGINT) TO app_ops, app_system;
+GRANT EXECUTE ON FUNCTION api.ops_create_draft(TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, DATE) TO app_ops, app_system;
+
+COMMIT;
